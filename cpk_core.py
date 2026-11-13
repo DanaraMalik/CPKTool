@@ -442,9 +442,10 @@ def build(folder, out_path, original=None, progress=None):
                 continue                      # file dihapus -> tidak dimasukkan
             ents.append(dict(e, path=p, rel=rel, new=False))
         next_id = max([e['id'] or 0 for e in man['files']] + [-1]) + 1
-        for root, _, names in os.walk(folder):
+        for root, dirs, names in os.walk(folder):
+            dirs[:] = [d for d in dirs if d != '_cpk_backup']
             for nm in sorted(names):
-                if nm == MANIFEST:
+                if nm == MANIFEST or nm.endswith('.tmp'):
                     continue
                 full = os.path.join(root, nm)
                 rel = os.path.relpath(full, folder).replace(os.sep, '/')

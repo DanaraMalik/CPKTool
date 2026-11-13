@@ -10,13 +10,16 @@ from kivy.properties import StringProperty, NumericProperty, BooleanProperty
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.label import Label
+from kivy.uix.widget import Widget
 from kivy.uix.popup import Popup
 from kivy.uix.screenmanager import ScreenManager, Screen
 from kivy.utils import platform
 
 import cpk_core as core
+import edit_core as ed
 
 Window.clearcolor = (0.08, 0.09, 0.12, 1)
+Window.softinput_mode = 'below_target'
 ON_ANDROID = platform == 'android'
 START_DIR = '/storage/emulated/0' if ON_ANDROID else os.path.expanduser('~')
 
@@ -140,6 +143,10 @@ KV = '''
             text: '2. SUSUN CPK\\n(gabung lagi jadi satu .cpk)'
             background_color: 0.15, 0.40, 0.75, 1
             on_release: app.root.current = 'build'
+        BigBtn:
+            text: '3. EDIT FILE\\n(ubah teks / angka di .bin & .str)'
+            background_color: 0.80, 0.48, 0.10, 1
+            on_release: app.root.current = 'edit'
         Btn:
             text: 'Cara pakai'
             on_release: app.show_help()
@@ -393,6 +400,7 @@ class ExtractScreen(WorkScreen):
         self.say('Membongkar...', replace=True)
         cpk, out = self.cpk_path, self.out_dir
         def done(r):
+            App.get_running_app().last_dir = r['outdir']
             txt = ('SELESAI!\n%d file dibongkar (%d file game sudah didekode).\n'
                    'Folder hasil:\n%s\n\nEdit file di dalamnya, lalu pakai menu '
                    '"SUSUN CPK".\nJangan hapus file _cpk_manifest.json.'
@@ -460,6 +468,274 @@ class BuildScreen(WorkScreen):
         self.run_bg(lambda cb: core.build(folder, out, orig, cb), done)
 
 
+# ------------------------------------------------------------ editor file
+import kivy
+from kivy.factory import Factory
+from kivy.uix.textinput import TextInput
+from kivy.uix.spinner import Spinner
+from kivy.uix.scrollview import ScrollView
+from kivy.uix.gridlayout import GridLayout
+
+_MONO = os.path.join(kivy.kivy_data_dir, 'fonts', 'RobotoMono-Regular.ttf')
+if not os.path.exists(_MONO):
+    _MONO = 'Roboto'
+
+
+def _btn(text, cb, h=48, color=(0.18, 0.21, 0.30, 1), **kw):
+    b = Button(text=text, size_hint_y=None, height=dp(h), background_normal='',
+               background_color=color, font_size='15sp', **kw)
+    b.bind(on_release=lambda *_: cb())
+    return b
+
+def _txt(text='', h=None, color=(0.92, 0.94, 0.98, 1), size='14sp', **kw):
+    l = Label(text=text, color=color, font_size=size, size_hint_y=None,
+              halign='left', valign='top', **kw)
+    l.bind(width=lambda w, v: setattr(w, 'text_size', (v, None)))
+    l.bind(texture_size=lambda w, ts: setattr(w, 'height', h or ts[1] + dp(6)))
+    return l
+
+def _inp(hint='', text='', h=46, **kw):
+    return TextInput(hint_text=hint, text=text, multiline=False, size_hint_y=None,
+                     height=dp(h), font_size='16sp', write_tab=False, **kw)
+
+
+class EditScreen(Screen):
+    """Editor sederhana: Teks / Angka / Hex. Setiap 'Terapkan' langsung disimpan
+    ke file (cadangan asli dibuat otomatis di folder _cpk_backup)."""
+    PAGE = 128
+
+    def __init__(self, **kw):
+        super().__init__(name='edit', **kw)
+        self.path, self.data, self.strings, self.mode = '', None, [], 'teks'
+        self.hex_off = 0
+        root = BoxLayout(orientation='vertical', padding=dp(12), spacing=dp(8))
+        root.add_widget(_txt('Edit file', size='22sp', bold=True))
+        root.add_widget(_btn('Pilih file (.bin / .str)', self.pick, 52))
+        self.lbl_file = _txt('Belum ada file dipilih.', color=(0.6, 0.9, 0.7, 1))
+        root.add_widget(self.lbl_file)
+        tabs = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(6))
+        self.tabs = {}
+        for key, name in (('teks', 'Teks'), ('angka', 'Angka'), ('hex', 'Hex')):
+            b = _btn(name, lambda k=key: self.set_mode(k), 46)
+            self.tabs[key] = b; tabs.add_widget(b)
+        root.add_widget(tabs)
+        self.body = BoxLayout(orientation='vertical', spacing=dp(6))
+        root.add_widget(self.body)
+        self.lbl_status = _txt('', color=(1, 0.85, 0.5, 1))
+        root.add_widget(self.lbl_status)
+        row = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(6))
+        row.add_widget(_btn('Kembalikan ke asli', self.restore, 48, (0.55, 0.25, 0.2, 1)))
+        row.add_widget(_btn('Kembali', self.go_back, 48))
+        root.add_widget(row)
+        self.add_widget(root)
+        self.set_mode('teks')
+
+    # ---- umum
+    def go_back(self):
+        App.get_running_app().root.current = 'home'
+
+    def say(self, t):
+        self.lbl_status.text = t
+
+    def pick(self):
+        start = os.path.dirname(self.path) if self.path else \
+            getattr(App.get_running_app(), 'last_dir', None)
+        Picker('file', self.open_file, start, exts=(), title='Pilih file untuk diedit').open()
+
+    def open_file(self, p):
+        try:
+            self.data = ed.load(p)
+        except Exception as e:
+            self.say(str(e)); return
+        self.path = p
+        self.strings = ed.find_strings(self.data)
+        self.lbl_file.text = '%s  (%d byte, %d teks ditemukan)' % (
+            os.path.basename(p), len(self.data), len(self.strings))
+        self.hex_off = 0
+        self.say('File dibuka. Setiap perubahan langsung tersimpan.')
+        self.set_mode(self.mode)
+
+    def set_mode(self, mode):
+        self.mode = mode
+        for k, b in self.tabs.items():
+            b.background_color = (0.80, 0.48, 0.10, 1) if k == mode else (0.18, 0.21, 0.30, 1)
+        self.body.clear_widgets()
+        if self.data is None:
+            self.body.add_widget(_txt('Tekan "Pilih file" dulu.\n\nTips: pilih file di folder '
+                                      '_hasil hasil bongkar, mis. Ball.bin atau all_diff.str.'))
+            return
+        getattr(self, 'panel_' + mode)()
+
+    def _commit(self, ok_msg):
+        try:
+            ed.save(self.path, self.data)
+        except Exception as e:
+            self.say('Gagal menyimpan: %s' % e); return False
+        self.strings = ed.find_strings(self.data)
+        self.lbl_file.text = '%s  (%d byte, %d teks ditemukan)' % (
+            os.path.basename(self.path), len(self.data), len(self.strings))
+        self.say(ok_msg)
+        return True
+
+    def restore(self):
+        if not self.path:
+            return
+        if ed.restore_backup(self.path):
+            self.data = ed.load(self.path)
+            self.strings = ed.find_strings(self.data)
+            self.say('File dikembalikan ke kondisi asli.')
+            self.set_mode(self.mode)
+        else:
+            self.say('Belum ada perubahan, jadi belum ada cadangan.')
+
+    # ---- panel TEKS
+    def panel_teks(self):
+        self.search = _inp('Cari teks... (kosong = semua)')
+        self.search.bind(text=lambda *_: self.refresh_list())
+        self.body.add_widget(self.search)
+        sv = ScrollView()
+        self.lst = GridLayout(cols=1, spacing=dp(4), size_hint_y=None)
+        self.lst.bind(minimum_height=self.lst.setter('height'))
+        sv.add_widget(self.lst)
+        self.body.add_widget(sv)
+        self.refresh_list()
+
+    def refresh_list(self):
+        q = (self.search.text or '').lower()
+        self.lst.clear_widgets()
+        hits = [x for x in self.strings if q in x[2].lower()]
+        if not hits:
+            self.lst.add_widget(_txt('Tidak ada teks yang cocok. Coba tab "Angka" atau "Hex".'))
+            return
+        for item in hits[:120]:
+            off, n, t = item
+            one = t.replace('\n', ' ')
+            b = Button(text='%s\n[size=12sp]posisi %d  |  maks %d byte[/size]' %
+                       (one[:70].replace('[', '(').replace(']', ')'), off, n),
+                       markup=True, size_hint_y=None, height=dp(62), halign='left',
+                       valign='middle', background_normal='', font_size='15sp',
+                       background_color=(0.16, 0.36, 0.28, 1))
+            b.bind(size=lambda w, s: setattr(w, 'text_size', (s[0] - dp(16), None)))
+            b.bind(on_release=lambda w, it=item: self.edit_text(it))
+            self.lst.add_widget(b)
+        if len(hits) > 120:
+            self.lst.add_widget(_txt('... %d lainnya. Ketik di kolom cari untuk mempersempit.'
+                                     % (len(hits) - 120)))
+
+    def edit_text(self, item):
+        off, n, t = item
+        box = BoxLayout(orientation='vertical', spacing=dp(8), padding=dp(8))
+        box.add_widget(_txt('Maksimal %d byte (huruf biasa = 1 byte). Kalau lebih pendek, '
+                            'sisanya otomatis diisi kosong. Jangan lebih panjang.' % n,
+                            size='13sp'))
+        ti = TextInput(text=t, multiline=True, font_size='16sp')
+        box.add_widget(ti)
+        info = _txt('', size='13sp', color=(0.7, 0.9, 1, 1))
+        def upd(*_):
+            k = len(ti.text.encode('utf-8'))
+            info.text = 'Terpakai %d dari %d byte' % (k, n)
+            info.color = (1, 0.5, 0.5, 1) if k > n else (0.7, 0.9, 1, 1)
+        ti.bind(text=upd); upd()
+        box.add_widget(info)
+        row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(8))
+        pop = Popup(title='Ubah teks', content=box, size_hint=(0.96, 0.7))
+        def apply():
+            try:
+                ed.replace_text(self.data, off, n, ti.text)
+            except ed.EditError as e:
+                info.text = str(e); info.color = (1, 0.5, 0.5, 1); return
+            if self._commit('Teks diubah & disimpan.'):
+                pop.dismiss(); self.refresh_list()
+        row.add_widget(_btn('Batal', pop.dismiss, 52))
+        row.add_widget(_btn('Terapkan', apply, 52, (0.12, 0.55, 0.35, 1)))
+        box.add_widget(row)
+        pop.open()
+
+    # ---- panel ANGKA
+    def panel_angka(self):
+        b = self.body
+        b.add_widget(_txt('Ubah angka di posisi (offset) tertentu. Lihat posisi di tab Hex. '
+                          'Boleh ditulis desimal (28) atau hex (0x1C).', size='13sp'))
+        self.in_off = _inp('Offset, mis. 28 atau 0x1C')
+        b.add_widget(self.in_off)
+        self.sp = Spinner(text=list(ed.KINDS)[1], values=list(ed.KINDS), size_hint_y=None,
+                          height=dp(46), background_normal='',
+                          background_color=(0.25, 0.28, 0.38, 1))
+        b.add_widget(self.sp)
+        b.add_widget(_btn('Baca nilai sekarang', self.read_num, 48))
+        self.lbl_num = _txt('', color=(0.6, 0.9, 0.7, 1), size='16sp')
+        b.add_widget(self.lbl_num)
+        self.in_val = _inp('Nilai baru')
+        b.add_widget(self.in_val)
+        b.add_widget(_btn('Terapkan', self.write_num, 52, (0.12, 0.55, 0.35, 1)))
+        b.add_widget(Widget())
+
+    def read_num(self):
+        try:
+            off = ed.parse_offset(self.in_off.text, len(self.data))
+            v = ed.read_number(self.data, off, self.sp.text)
+            self.lbl_num.text = 'Nilai sekarang: %d  (hex %X)' % (v, v)
+            self.in_val.text = str(v)
+        except ed.EditError as e:
+            self.say(str(e))
+
+    def write_num(self):
+        try:
+            off = ed.parse_offset(self.in_off.text, len(self.data))
+            ed.write_number(self.data, off, self.sp.text, self.in_val.text)
+        except ed.EditError as e:
+            self.say(str(e)); return
+        if self._commit('Angka diubah & disimpan.'):
+            self.read_num()
+
+    # ---- panel HEX
+    def panel_hex(self):
+        b = self.body
+        top = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(6))
+        self.in_hoff = _inp('Offset', text=str(self.hex_off))
+        top.add_widget(self.in_hoff)
+        top.add_widget(_btn('Lihat', self.hex_goto, 46))
+        b.add_widget(top)
+        sv = ScrollView(do_scroll_x=True)
+        self.lbl_dump = Label(font_name=_MONO, font_size='12sp', halign='left', valign='top',
+                              size_hint=(None, None), color=(0.85, 1, 0.9, 1))
+        self.lbl_dump.bind(texture_size=lambda w, ts: setattr(w, 'size', ts))
+        sv.add_widget(self.lbl_dump)
+        b.add_widget(sv)
+        nav = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+        nav.add_widget(_btn('< Sebelumnya', lambda: self.hex_page(-1), 44))
+        nav.add_widget(_btn('Berikutnya >', lambda: self.hex_page(1), 44))
+        b.add_widget(nav)
+        self.in_hex = _inp('Hex baru di offset di atas, mis. 64 00')
+        b.add_widget(self.in_hex)
+        b.add_widget(_btn('Tulis hex di offset tsb', self.hex_write, 50, (0.12, 0.55, 0.35, 1)))
+        self.hex_show()
+
+    def hex_show(self):
+        self.lbl_dump.text = ed.hex_dump(self.data, self.hex_off, 16)
+
+    def hex_goto(self):
+        try:
+            self.hex_off = ed.parse_offset(self.in_hoff.text, len(self.data))
+        except ed.EditError as e:
+            self.say(str(e)); return
+        self.hex_show()
+
+    def hex_page(self, d):
+        self.hex_off = max(0, min(len(self.data) - 1, self.hex_off + d * self.PAGE))
+        self.in_hoff.text = str(self.hex_off); self.hex_show()
+
+    def hex_write(self):
+        try:
+            off = ed.parse_offset(self.in_hoff.text, len(self.data))
+            n = ed.write_hex(self.data, off, self.in_hex.text)
+        except ed.EditError as e:
+            self.say(str(e)); return
+        self.hex_off = off
+        if self._commit('%d byte ditulis & disimpan.' % n):
+            self.hex_show()
+
+
 HELP = (
     'BONGKAR (membuka CPK)\n'
     '1. Salin file .cpk ke memori HP (mis. folder Download).\n'
@@ -469,6 +745,10 @@ HELP = (
     '1. Edit/ganti file di folder hasil (nama file jangan diubah).\n'
     '2. Tekan "Susun CPK" > pilih folder hasil > (pilih CPK asli) > "Mulai susun".\n'
     '3. Hasil: <nama>_BARU.cpk. Ganti nama sesuai aslinya saat menaruhnya di game.\n\n'
+    'EDIT FILE\n'
+    'Menu 3: pilih file .bin/.str di folder hasil. Tab Teks = ganti tulisan (tidak boleh '
+    'lebih panjang dari aslinya). Tab Angka = ubah angka. Tab Hex = lihat/ubah byte. '
+    'Tiap perubahan langsung tersimpan; tombol "Kembalikan ke asli" membatalkannya.\n\n'
     'Tips: SIMPAN CADANGAN file CPK asli sebelum menimpanya di game.\n'
     'File yang ditambahkan ke folder otomatis ikut dimasukkan; file yang dihapus '
     'tidak ikut.')
@@ -484,6 +764,7 @@ class CpkApp(App):
         self.sm.add_widget(self.home)
         self.sm.add_widget(ExtractScreen())
         self.sm.add_widget(BuildScreen())
+        self.sm.add_widget(EditScreen())
         self.home.need_perm = not has_all_files()
         Window.bind(on_keyboard=self.on_key)
         return self.sm
